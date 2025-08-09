@@ -1,288 +1,203 @@
-"""
-Enhanced RAG-Based QA System - CLI Interface
-Features: Interactive mode, batch processing, evaluation metrics
-"""
-
-import os
-import sys
 import argparse
-import time
-from typing import List, Dict, Optional
-from datetime import datetime
-import json
-import readline  # For better CLI input handling
-
-# Import our RAG system components
+import os
+from typing import List, Dict, Any
 from rag_system import RAGSystem
 from config import Config
-from utils import DocumentProcessor, ChatHistoryManager, Evaluator
+from utils import DocumentProcessor, ChatHistoryManager
 
 class RAGCLI:
-    def __init__(self, config_path: str = None):
-        """Initialize the CLI interface"""
-        self.config = Config(config_path)
+    def __init__(self):
+        self.config = Config()
         self.rag_system = RAGSystem(self.config)
-        self.chat_history = ChatHistoryManager()
-        self.evaluator = Evaluator()
-        self.documents_processed = []
+        self.history_manager = ChatHistoryManager(max_history=100)
+        self.conversation_memory = []
+
+    def process_documents(self, docs: List[str], force_reprocess: bool = False):
+        """Process and ingest documents into the RAG system"""
+        print(f"📄 Processing {len(docs)} document(s)...")
+        dp = DocumentProcessor(self.config)
         
-    def process_documents(self, document_paths: List[str], force_reprocess: bool = False):
-        """Process documents with progress tracking"""
-        print("📄 Processing documents...")
+        processed_count = 0
+        for doc in docs:
+            if os.path.exists(doc):
+                try:
+                    chunks = dp.process_document(doc)
+                    if not chunks:
+                        print(f"⚠️  No content extracted from {doc}. Document might be empty or corrupted.")
+                        continue
+                        
+                    self.rag_system.add_documents(chunks, os.path.basename(doc), force_reprocess=force_reprocess)
+                    processed_count += 1
+                    print(f"✅ Processed {doc} ({len(chunks)} chunks)")
+                except Exception as e:
+                    print(f"❌ Error processing {doc}: {str(e)}")
+            else:
+                print(f"❌ File not found: {doc}")
         
-        for doc_path in document_paths:
-            if not os.path.exists(doc_path):
-                print(f"❌ Document not found: {doc_path}")
-                continue
-                
-            try:
-                print(f"🔄 Processing: {doc_path}")
-                
-                # Process document
-                doc_processor = DocumentProcessor()
-                chunks = doc_processor.process_document(doc_path)
-                
-                # Add to RAG system
-                self.rag_system.add_documents(chunks, os.path.basename(doc_path), 
-                                            force_reprocess=force_reprocess)
-                
-                self.documents_processed.append(os.path.basename(doc_path))
-                print(f"✅ Processed: {doc_path}")
-                
-            except Exception as e:
-                print(f"❌ Error processing {doc_path}: {str(e)}")
+        # Verify ingestion
+        doc_count = self.rag_system.get_document_count()
+        chunk_count = self.rag_system.get_chunk_count()
+        print(f"\n📊 Ingestion Summary:")
+        print(f"   - Documents processed: {processed_count}/{len(docs)}")
+        print(f"   - Total documents in system: {doc_count}")
+        print(f"   - Total chunks in system: {chunk_count}")
+
+    def ask(self, question: str):
+        """Ask a question to the RAG system with enhanced output"""
+        print(f"\n🔍 Query: {question}")
         
-        print(f"🎉 Successfully processed {len(self.documents_processed)} documents!")
+        # Query the RAG system
+        res = self.rag_system.query(
+            question,
+            k=self.config.rag.retriever_k,
+            top_n_after_rerank=self.config.rag.top_n_after_rerank
+        )
         
-    def interactive_mode(self):
-        """Start interactive question-answering mode"""
-        if not self.documents_processed:
-            print("❌ No documents processed. Please process documents first.")
+        # Display answer
+        print(f"\n📢 Answer:")
+        print(res["answer"])
+        
+        # Display sources
+        if res["sources"]:
+            print(f"\n📚 Sources: {', '.join(res['sources'])}")
+        else:
+            print("\n📚 No sources identified")
+        
+        # Display query time
+        print(f"\n⏱️  Query time: {res['query_time']:.2f} seconds")
+        
+        # Display retrieved context
+        if res["context_used"]:
+            print("\n📄 Retrieved Context:")
+            for i, ctx in enumerate(res["context_used"]):
+                print(f"\n--- Chunk {i+1} ---")
+                print(ctx[:300] + "..." if len(ctx) > 300 else ctx)
+        else:
+            print("\n📄 No context was retrieved for this query")
+        
+        # Display conversation memory
+        print("\n💬 Conversation Memory:")
+        memory_content = self.rag_system.get_conversation_history()
+        print(memory_content if memory_content else "No conversation history")
+        
+        # Update conversation memory
+        self.conversation_memory.append((question, res["answer"]))
+        if len(self.conversation_memory) > 10:
+            self.conversation_memory = self.conversation_memory[-10:]
+            
+        # Save to persistent history (if enabled)
+        if self.config.app.auto_save:
+            self.history_manager.add_exchange(question, res["answer"], res["query_time"], res["sources"])
+
+    def show_history(self):
+        """Display chat history with detailed information"""
+        hist = self.history_manager.get_history()
+        if not hist:
+            print("No conversation history found.")
             return
             
-        print("\n🤖 RAG-Based QA System - Interactive Mode")
-        print("💬 Type your questions and press Enter")
-        print("📝 Type 'history' to see chat history")
-        print("📊 Type 'stats' to see system statistics")
-        print("🗑️  Type 'clear' to clear chat history")
-        print("🚪 Type 'exit' or 'quit' to exit")
-        print("-" * 50)
+        print(f"\n💬 Chat History ({len(hist)} exchanges):")
+        for i, h in enumerate(hist, 1):
+            print(f"\n--- Exchange {i} ---")
+            print(f"Q: {h['question']}")
+            print(f"A: {h['answer']}")
+            print(f"Sources: {', '.join(h['sources']) if h['sources'] else 'None'}")
+            print(f"Response time: {h['response_time']:.2f}s")
+            print(f"Timestamp: {h['timestamp']}")
+
+    def show_status(self):
+        """Show current vector store status"""
+        doc_count = self.rag_system.get_document_count()
+        chunk_count = self.rag_system.get_chunk_count()
+        print(f"\n📊 FAISS Vector Store Status:")
+        print(f"   - Documents: {doc_count}")
+        print(f"   - Chunks: {chunk_count}")
+        print(f"   - In-memory: Yes")
+        print(f"   - LLM Provider: {self.rag_system.current_llm_provider}")
+
+    def clear_memory(self):
+        """Clear conversation memory and history"""
+        self.conversation_memory.clear()
+        self.rag_system.clear_memory()
+        self.history_manager.clear()
+        print("✅ Conversation memory and history cleared")
+
+    def clear_vector_store(self):
+        """Clear the in-memory vector store"""
+        self.rag_system.clear_documents()
+        print("✅ In-memory FAISS vector store cleared")
+
+def main():
+    parser = argparse.ArgumentParser(description="RAG-Based QA System CLI (FAISS In-Memory)")
+    parser.add_argument("-d", "--documents", nargs="+", help="Documents to process")
+    parser.add_argument("-q", "--question", help="Question to ask")
+    parser.add_argument("--force", action="store_true", help="Force reprocess documents")
+    parser.add_argument("--history", action="store_true", help="Show chat history")
+    parser.add_argument("--status", action="store_true", help="Show vector store status")
+    parser.add_argument("--clear", action="store_true", help="Clear conversation memory")
+    parser.add_argument("--clear-store", action="store_true", help="Clear vector store")
+    parser.add_argument("--interactive", action="store_true", help="Start interactive mode")
+    parser.add_argument("--debug", action="store_true", help="Enable debug output")
+    
+    args = parser.parse_args()
+    cli = RAGCLI()
+    
+    if args.debug:
+        print("🔧 Debug mode enabled")
+        print(f"Configuration: LLM={cli.config.llm.default_provider}, "
+              f"Retriever_k={cli.config.rag.retriever_k}, "
+              f"Top_n={cli.config.rag.top_n_after_rerank}")
+    
+    if args.clear:
+        cli.clear_memory()
+    
+    if args.clear_store:
+        cli.clear_vector_store()
+    
+    if args.documents:
+        cli.process_documents(args.documents, force_reprocess=args.force)
+    
+    if args.question:
+        cli.ask(args.question)
+    
+    if args.history:
+        cli.show_history()
+    
+    if args.status:
+        cli.show_status()
+    
+    if args.interactive:
+        print("\n🤖 RAG-Based QA System - Interactive Mode (FAISS In-Memory)")
+        print("Type 'exit' to quit, 'clear' to clear history, 'status' for status, 'help' for commands")
         
         while True:
             try:
-                question = input("\n❓ Your Question: ").strip()
+                user_input = input("\n> ").strip()
                 
-                if question.lower() in ['exit', 'quit']:
+                if user_input.lower() in ['exit', 'quit']:
                     print("👋 Goodbye!")
                     break
-                    
-                elif question.lower() == 'history':
-                    self.show_chat_history()
-                    continue
-                    
-                elif question.lower() == 'stats':
-                    self.show_statistics()
-                    continue
-                    
-                elif question.lower() == 'clear':
-                    self.chat_history.clear()
-                    print("🗑️  Chat history cleared!")
-                    continue
-                    
-                elif not question:
-                    continue
-                    
-                # Process question
-                self.process_question(question)
-                
+                elif user_input.lower() == 'clear':
+                    cli.clear_memory()
+                elif user_input.lower() == 'clear store':
+                    cli.clear_vector_store()
+                elif user_input.lower() == 'status':
+                    cli.show_status()
+                elif user_input.lower() == 'help':
+                    print("\nAvailable commands:")
+                    print("  exit/quit    - Exit the program")
+                    print("  clear        - Clear conversation history")
+                    print("  clear store  - Clear vector store")
+                    print("  status       - Show vector store status")
+                    print("  help         - Show this help message")
+                    print("  <question>   - Ask a question")
+                elif user_input:
+                    cli.ask(user_input)
             except KeyboardInterrupt:
-                print("\n\n👋 Goodbye!")
+                print("\n👋 Goodbye!")
                 break
             except Exception as e:
                 print(f"❌ Error: {str(e)}")
-    
-    def process_question(self, question: str):
-        """Process a single question"""
-        print("🤔 Thinking...")
-        
-        start_time = time.time()
-        
-        try:
-            # Get answer from RAG system
-            response = self.rag_system.query(question)
-            
-            end_time = time.time()
-            response_time = end_time - start_time
-            
-            # Display answer
-            print("\n📢 Answer:")
-            print("-" * 30)
-            print(response["answer"])
-            print("-" * 30)
-            
-            # Display sources if available
-            if response.get("sources"):
-                print("\n📚 Sources:")
-                for i, source in enumerate(response["sources"], 1):
-                    print(f"  {i}. {source}")
-            
-            # Display metrics
-            print(f"\n⏱️  Response time: {response_time:.2f} seconds")
-            
-            # Add to chat history
-            self.chat_history.add_exchange(question, response["answer"], 
-                                          response_time, response.get("sources", []))
-            
-        except Exception as e:
-            print(f"❌ Error: {str(e)}")
-    
-    def show_chat_history(self):
-        """Display chat history"""
-        history = self.chat_history.get_history()
-        
-        if not history:
-            print("📝 No chat history yet.")
-            return
-            
-        print("\n📝 Chat History:")
-        print("=" * 50)
-        
-        for i, exchange in enumerate(history, 1):
-            print(f"\n--- Exchange {i} ---")
-            print(f"❓ Question: {exchange['question']}")
-            print(f"📢 Answer: {exchange['answer']}")
-            print(f"⏱️  Response time: {exchange['response_time']:.2f}s")
-            if exchange.get('sources'):
-                print(f"📚 Sources: {', '.join(exchange['sources'])}")
-            print(f"🕐 Timestamp: {exchange['timestamp']}")
-        
-        print("=" * 50)
-    
-    def show_statistics(self):
-        """Display system statistics"""
-        stats = {
-            "documents_processed": len(self.documents_processed),
-            "chat_exchanges": len(self.chat_history.get_history()),
-            "total_response_time": sum(ex["response_time"] for ex in self.chat_history.get_history()),
-            "average_response_time": 0
-        }
-        
-        if stats["chat_exchanges"] > 0:
-            stats["average_response_time"] = stats["total_response_time"] / stats["chat_exchanges"]
-        
-        print("\n📊 System Statistics:")
-        print("=" * 30)
-        print(f"📄 Documents processed: {stats['documents_processed']}")
-        print(f"💬 Chat exchanges: {stats['chat_exchanges']}")
-        print(f"⏱️  Total response time: {stats['total_response_time']:.2f}s")
-        print(f"📈 Average response time: {stats['average_response_time']:.2f}s")
-        print("=" * 30)
-    
-    def batch_mode(self, questions_file: str, output_file: str = None):
-        """Process questions in batch mode"""
-        if not os.path.exists(questions_file):
-            print(f"❌ Questions file not found: {questions_file}")
-            return
-        
-        try:
-            with open(questions_file, 'r', encoding='utf-8') as f:
-                questions = [line.strip() for line in f if line.strip()]
-            
-            print(f"📋 Processing {len(questions)} questions in batch mode...")
-            
-            results = []
-            for i, question in enumerate(questions, 1):
-                print(f"🔄 Processing question {i}/{len(questions)}: {question[:50]}...")
-                
-                try:
-                    response = self.rag_system.query(question)
-                    results.append({
-                        "question": question,
-                        "answer": response["answer"],
-                        "sources": response.get("sources", [])
-                    })
-                except Exception as e:
-                    results.append({
-                        "question": question,
-                        "answer": f"Error: {str(e)}",
-                        "sources": []
-                    })
-            
-            # Save results
-            if output_file:
-                with open(output_file, 'w', encoding='utf-8') as f:
-                    json.dump(results, f, indent=2, ensure_ascii=False)
-                print(f"✅ Results saved to: {output_file}")
-            
-            print("🎉 Batch processing completed!")
-            
-        except Exception as e:
-            print(f"❌ Error in batch mode: {str(e)}")
-    
-    def evaluation_mode(self, eval_file: str):
-        """Run evaluation mode with ground truth data"""
-        if not os.path.exists(eval_file):
-            print(f"❌ Evaluation file not found: {eval_file}")
-            return
-        
-        try:
-            with open(eval_file, 'r', encoding='utf-8') as f:
-                eval_data = json.load(f)
-            
-            print("🔍 Running evaluation...")
-            
-            metrics = self.evaluator.evaluate(self.rag_system, eval_data)
-            
-            print("\n📊 Evaluation Results:")
-            print("=" * 40)
-            print(f"🎯 Accuracy: {metrics['accuracy']:.2%}")
-            print(f"📏 Precision: {metrics['precision']:.2%}")
-            print(f"📐 Recall: {metrics['recall']:.2%}")
-            print(f"📊 F1 Score: {metrics['f1_score']:.2%}")
-            print(f"⏱️  Average response time: {metrics['avg_response_time']:.2f}s")
-            print("=" * 40)
-            
-        except Exception as e:
-            print(f"❌ Error in evaluation mode: {str(e)}")
-
-def main():
-    parser = argparse.ArgumentParser(description="RAG-Based QA System CLI")
-    parser.add_argument("--config", "-c", help="Path to configuration file")
-    parser.add_argument("--documents", "-d", nargs="+", help="Paths to documents to process")
-    parser.add_argument("--force-reprocess", action="store_true", help="Force reprocessing of documents")
-    parser.add_argument("--interactive", "-i", action="store_true", help="Start interactive mode")
-    parser.add_argument("--batch", "-b", help="Path to questions file for batch processing")
-    parser.add_argument("--output", "-o", help="Output file for batch results")
-    parser.add_argument("--evaluate", "-e", help="Path to evaluation file")
-    
-    args = parser.parse_args()
-    
-    # Initialize CLI
-    cli = RAGCLI(args.config)
-    
-    # Process documents if provided
-    if args.documents:
-        cli.process_documents(args.documents, args.force_reprocess)
-    
-    # Start interactive mode
-    if args.interactive:
-        cli.interactive_mode()
-    
-    # Batch processing
-    if args.batch:
-        cli.batch_mode(args.batch, args.output)
-    
-    # Evaluation mode
-    if args.evaluate:
-        cli.evaluation_mode(args.evaluate)
-    
-    # If no arguments provided, show help
-    if not any(vars(args).values()):
-        parser.print_help()
-        print("\n💡 Example usage:")
-        print("  python main.py -d doc1.pdf doc2.txt -i")
-        print("  python main.py --batch questions.txt --output results.json")
-        print("  python main.py --evaluate eval_data.json")
 
 if __name__ == "__main__":
     main()
